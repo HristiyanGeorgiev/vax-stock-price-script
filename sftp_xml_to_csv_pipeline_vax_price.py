@@ -7,24 +7,30 @@ SFTP XML → CSV pipeline - Vax Prices
 - For each job:
     - Finds source file by wildcard (e.g., price-34-*.xml), picks latest
     - Downloads locally (temp)
-    - Streams XML and maps sku → (RRP, sellingPrice)
+    - Streams XML and maps sku → (price, special_price,
+      special_from_date, special_to_date)
     - If a sku appears more than once, the last occurrence wins and a
       warning is logged
-    - Writes a CSV (sku, RRP, sellingPrice) with a timestamp appended to
-      the filename
+    - Writes a CSV (sku, price, special_price, special_from_date,
+      special_to_date, update price) with a timestamp appended to the
+      filename. The special_*_date columns are emitted as unix timestamps
+      (empty when the source date is blank) and "update price" is a fixed
+      "pending" value for every row.
     - Uploads the CSV to the SAME folder the XML was picked from
     - Moves processed source XML into a TransformedXML subfolder
     - If processing fails, moves the source XML into an Error subfolder so it
       won't be picked up again on the next run
     - Cleans up local temp files automatically
 XML format expected:
-    <Feed store_id="34" ...>
+    <Feed store_id="41" ...>
       <Products>
         <Product>
           <sku><![CDATA[...]]></sku>
           <status><![CDATA[...]]></status>
-          <RRP><![CDATA[129.000000]]></RRP>
-          <sellingPrice><![CDATA[129.000000]]></sellingPrice>
+          <price><![CDATA[229.990000]]></price>
+          <special_price><![CDATA[139.990000]]></special_price>
+          <special_from_date><![CDATA[2025-03-14 00:00:00]]></special_from_date>
+          <special_to_date><![CDATA[]]></special_to_date>
         </Product>
         ...
       </Products>
@@ -41,7 +47,7 @@ import fnmatch
 import tempfile
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import xml.etree.ElementTree as ET
 import csv
@@ -83,7 +89,18 @@ TRANSFORMED_SUBFOLDER = "TransformedXML"
 # Subfolder where XMLs that failed processing are quarantined
 ERROR_SUBFOLDER = "Error"
 TIMESTAMP_FORMAT = "%Y_%m_%d_%H_%M_%S"  # YYYY_MM_DD_HH_MI_SS
-CSV_HEADER = ["sku", "RRP", "sellingPrice"]
+# Source date format inside the feed, e.g. "2025-03-14 00:00:00"
+SOURCE_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+CSV_HEADER = [
+    "sku",
+    "price",
+    "special_price",
+    "special_from_date",
+    "special_to_date",
+    "update price",
+]
+# Fixed value written into the "update price" column for every row.
+UPDATE_PRICE_VALUE = "pending"
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -192,12 +209,33 @@ def _parse_price(raw: str):
         return Decimal(s)
     except InvalidOperation:
         return None
+def _parse_date_to_unix(raw: str):
+    """
+    Convert a source date string (e.g. "2025-03-14 00:00:00") to an integer
+    unix timestamp (seconds since epoch, UTC).
+    Returns None if the value is empty or cannot be parsed.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.strptime(s, SOURCE_DATE_FORMAT)
+    except ValueError:
+        logging.warning("Unparseable date %r — leaving blank", raw)
+        return None
+    # Treat the naive source timestamp as UTC for a deterministic conversion.
+    return int(dt.replace(tzinfo=timezone.utc).timestamp())
 def parse_and_write_csv(xml_path: Path, csv_path: Path) -> None:
     """
-    Streams the XML file and writes a CSV with columns: sku, RRP, sellingPrice.
+    Streams the XML file and writes a CSV with columns:
+    sku, price, special_price, special_from_date, special_to_date, update price.
     - Last occurrence wins if the same sku appears more than once (warned).
-    - Rows with empty sku or unparseable prices are skipped (warned).
-    - Prices are emitted with two decimal places.
+    - Rows with empty sku or unparseable price are skipped (warned).
+    - Prices are emitted with two decimal places; special_price is left blank
+      when the source value is empty.
+    - special_from_date / special_to_date are emitted as unix timestamps and
+      left blank when the source date is empty/unparseable.
+    - "update price" is always the fixed value "pending".
     """
     # Preserve insertion order so the CSV mirrors the XML's natural ordering,
     # overwriting on duplicate sku so last-wins semantics hold.
@@ -208,35 +246,48 @@ def parse_and_write_csv(xml_path: Path, csv_path: Path) -> None:
         local_tag = elem.tag.rsplit("}", 1)[-1]
         if local_tag == "Product":
             sku = None
-            rrp = None
-            selling = None
+            price = None
+            special_price = None
+            special_from = None
+            special_to = None
             for child in elem:
                 child_tag = child.tag.rsplit("}", 1)[-1]
                 if child_tag == "sku":
                     sku = (child.text or "").strip()
-                elif child_tag == "RRP":
-                    rrp = _parse_price(child.text)
-                elif child_tag == "sellingPrice":
-                    selling = _parse_price(child.text)
+                elif child_tag == "price":
+                    price = _parse_price(child.text)
+                elif child_tag == "special_price":
+                    special_price = _parse_price(child.text)
+                elif child_tag == "special_from_date":
+                    special_from = _parse_date_to_unix(child.text)
+                elif child_tag == "special_to_date":
+                    special_to = _parse_date_to_unix(child.text)
             elem.clear()
             if not sku:
                 logging.warning("Skipping <Product> with empty sku")
                 continue
-            if rrp is None or selling is None:
+            if price is None:
                 logging.warning(
-                    "Skipping sku %s — missing/unparseable price (RRP=%r, sellingPrice=%r)",
-                    sku, rrp, selling,
+                    "Skipping sku %s — missing/unparseable price (price=%r)",
+                    sku, price,
                 )
                 continue
             if sku in rows:
                 logging.warning("Duplicate sku %s — later value overwrites earlier", sku)
-            rows[sku] = (rrp, selling)
+            rows[sku] = (price, special_price, special_from, special_to)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(CSV_HEADER)
         for sku in sorted(rows.keys()):
-            rrp, selling = rows[sku]
-            writer.writerow([sku, f"{rrp:.2f}", f"{selling:.2f}"])
+            price, special_price, special_from, special_to = rows[sku]
+            writer.writerow([
+                sku,
+                f"{price:.2f}",
+                "" if special_price is None else f"{special_price:.2f}",
+                "" if special_from is None else special_from,
+                "" if special_to is None else special_to,
+                UPDATE_PRICE_VALUE,
+            ])
     logging.info("CSV written: %s (%d rows)", csv_path.name, len(rows))
 # -----------------------
 # SINGLE JOB RUNNER
