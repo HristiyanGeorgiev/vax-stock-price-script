@@ -72,7 +72,8 @@ FEED_JOBS = [
     {"src_glob": "stock-34-*.xml", "result_basename": "Stock_34"},
     {"src_glob": "stock-40-*.xml", "result_basename": "Stock_40"},
     {"src_glob": "stock-41-*.xml", "result_basename": "Stock_41"},
-    {"src_glob": "stock-42-*.xml", "result_basename": "Stock_42"}
+    {"src_glob": "stock-42-*.xml", "result_basename": "Stock_42"},
+    {"src_glob": "stock-43-*.xml", "result_basename": "Stock_43"}
 ]
 # Subfolder name within each src_dir where processed XMLs are archived
 TRANSFORMED_SUBFOLDER = "TransformedXML"
